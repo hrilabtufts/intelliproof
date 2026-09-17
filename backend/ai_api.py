@@ -55,7 +55,8 @@ from ai_models import (
     GenerateComprehensiveReportResponse,  # NEW
     ChatMessage,  # NEW
     ChatRequest,  # NEW
-    ChatResponse  # NEW
+    ChatResponse,  # NEW
+    LinkerResponse,
 )
 from llm_manager import run_llm, DEFAULT_MCP, ModelControlProtocol, AgentManager, run_llm_agentic, select_agent_for_task
 from datetime import datetime
@@ -2367,3 +2368,183 @@ def agentic_chat(data: ChatRequest = Body(...)):
     except Exception as e:
         print(f"Error in agentic chat endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Agentic chat processing failed: {str(e)}")
+
+
+def _extract_document_content(document: dict, max_chars: int = 12000) -> str:
+    """Return bounded text for a supporting document supplied by the client."""
+    existing_content = document.get("content") or document.get("text")
+    if existing_content:
+        return str(existing_content)[:max_chars]
+
+    document_url = document.get("url")
+    if not document_url:
+        return ""
+
+    response = requests.get(document_url, timeout=20, stream=True)
+    response.raise_for_status()
+    content_type = (response.headers.get("content-type") or "").lower()
+    chunks = []
+    total_bytes = 0
+    max_bytes = 8 * 1024 * 1024
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise ValueError("Supporting document exceeds the 8MB linker limit")
+        chunks.append(chunk)
+    document_data = b"".join(chunks)
+
+    is_pdf = "pdf" in content_type or str(document_url).lower().split("?", 1)[0].endswith(".pdf")
+    if is_pdf:
+        pdf = fitz.open(stream=document_data, filetype="pdf")
+        try:
+            return "\n\n".join(page.get_text() for page in pdf)[:max_chars]
+        finally:
+            pdf.close()
+
+    is_text = content_type.startswith("text/") or str(document_url).lower().split("?", 1)[0].endswith((".txt", ".md", ".csv"))
+    if is_text:
+        return document_data.decode("utf-8", errors="replace")[:max_chars]
+
+    return ""
+
+
+@router.post("/api/ai/linker", response_model=LinkerResponse)
+def linker_model(data: ChatRequest = Body(...)):
+    """
+    This model handles the auto-linking of nodes with evidence based on supporting documents. Specifically, it does the following: 
+    1. For each node in the argument graph, it analyzes the text of the node and compares it with the titles and excerpts of the supporting documents.
+    2. It identifies potential matches where the content of a supporting document is relevant to the claim made in the node.
+    3. It reads through the potentially relevant supporting documents and extracts key excerpts that substantiate or provide context for the node's claim.
+    4. It generates a list of evidence items that can be linked to each node, including the document ID, title, and relevant excerpt.
+    5. It returns a structured output that maps each node to its corresponding evidence items, facilitating the automatic linking of evidence to claims in the argument graph.
+    This model is designed to enhance the argument graph by ensuring that each claim is supported by relevant evidence, improving the overall credibility and persuasiveness of the argument structure.
+    """
+
+    try:
+        nodes = data.graph_data.get("nodes", [])
+        documents = data.graph_data.get("supportingDocuments", [])
+        enriched_documents = []
+        for document in documents:
+            enriched_document = dict(document)
+            try:
+                enriched_document["content"] = _extract_document_content(document)
+            except Exception as error:
+                print(
+                    f"[ai_api] linker_model: Could not extract "
+                    f"{document.get('name', 'document')}: {error}"
+                )
+                enriched_document["content"] = ""
+            enriched_documents.append(enriched_document)
+
+        auto_link_prompt = f"""
+                You are the IntelliProof Evidence Linking Agent, a precision reasoning engine designed to ground argument graphs in empirical source material. Your sole function is to evaluate claims (graph nodes) against supporting documents, identify relevant textual substantiation or refutation, extract exact quotes, and produce structured node-to-evidence links.
+
+                You do not engage in conversation. You output ONLY valid, parsable JSON matching the schema below.
+
+                **CURRENT GRAPH NODES ({len(nodes)} total):**
+                {chr(10).join([f"- Node ID: {node.get('id', 'Unknown')} | Type: {node.get('data', {}).get('type', 'factual')} | Claim: {node.get('data', {}).get('text', node.get('text', 'No text'))}" for node in nodes]) if nodes else "Empty"}
+
+                **AVAILABLE SUPPORTING DOCUMENTS ({len(documents)} total):**
+                {chr(10).join([f"--- DOCUMENT ID: {doc.get('id', 'Unknown')} | NAME: {doc.get('name', 'Untitled')} ---{chr(10)}CONTENT:{chr(10)}{doc.get('content', 'No content')}{chr(10)}" for doc in enriched_documents]) if enriched_documents else "Empty"}
+
+                **LINKING INSTRUCTIONS:**
+                1. RELEVANCE MATCHING: For each node, scan all supporting documents to determine whether any section directly supports, contextualizes, or challenges the claim.
+                2. VERBATIM EXTRACTION: The `excerpt` field MUST be an exact, continuous quote taken directly from the document content. Do not paraphrase, summarize, or alter the excerpt text.
+                3. GROUNDING CONSTRAINT: Never fabricate an excerpt or cite a document that does not explicitly mention the relevant fact. If a node has no supporting or conflicting evidence in the provided documents, return an empty array `[]` for that node.
+                4. CONFIDENCE ESTIMATION: Assign a `confidence` score between 0.0 and 1.0:
+                - 0.85 - 1.00: Direct proof, exact empirical statistic, or explicit confirmation.
+                - 0.60 - 0.84: Strong contextual evidence, related case study, or partial support.
+                - 0.40 - 0.59: Tangential or indirect context requiring inference.
+                5. IDENTIFIER FORMAT: Assign each evidence item an ID using the format `ev_<node_id>_<doc_id_short>_<index>`.
+
+                **JSON SCHEMA STRICT REQUIREMENTS:**
+                Your response must be a single JSON object with one top-level key: `"links"`.
+                - `"links"`: An array of objects, each containing:
+                - `"node_id"`: String matching the exact target Node ID.
+                - `"evidence_items"`: Array of evidence objects containing:
+                    - `"id"`: Unique evidence ID string (`"ev_<node_id>_<doc_id>_<index>"`).
+                    - `"supportingDocId"`: ID of the source document.
+                    - `"supportingDocName"`: Name/filename of the source document.
+                    - `"title"`: A concise, descriptive title (3-7 words) summarizing what this excerpt demonstrates.
+                    - `"excerpt"`: Exact verbatim quotation from the document.
+                    - `"confidence"`: Float between 0.0 and 1.0.
+
+                **FEW-SHOT EXAMPLE:**
+
+                User: (Provides nodes for UBI and economic growth along with employment survey documents)
+                Assistant:
+                {{
+                "links": [
+                    {{
+                    "node_id": "node-1",
+                    "evidence_items": [
+                        {{
+                        "id": "ev_node-1_docA_1",
+                        "supportingDocId": "doc-001-abc",
+                        "supportingDocName": "Stockton_SEI_Report_2021.pdf",
+                        "title": "Full-Time Employment Increase",
+                        "excerpt": "Recipients of the unconditional cash transfers showed a 12 percentage point increase in full-time employment within one year, rising from 28% to 40%.",
+                        "confidence": 0.94
+                        }}
+                    ]
+                    }},
+                    {{
+                    "node_id": "node-2",
+                    "evidence_items": []
+                    }}
+                ]
+                }}
+
+                **FINAL RULE:**
+                Do not include markdown code block wrappers (such as ```json or ```). Output ONLY raw, valid JSON.
+"""
+
+        linker_mcp = ModelControlProtocol(
+            model_name="gpt-5.4",
+            temperature=0.0,
+            max_completion_tokens=8192,
+            system_prompt=(
+                "You are the IntelliProof Evidence Linking Agent. "
+                "Follow the user's linking instructions exactly and return only "
+                "the requested raw JSON object."
+            ),
+        )
+
+        print(
+            f"[ai_api] linker_model: Linking {len(nodes)} nodes against "
+            f"{len(documents)} supporting documents"
+        )
+        response = run_llm_agentic(
+            [{"role": "user", "content": auto_link_prompt}],
+            linker_mcp,
+        )
+
+        cleaned_response = response.strip()
+        if cleaned_response.startswith("```"):
+            cleaned_response = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned_response).strip()
+
+        parsed_response = json.loads(cleaned_response)
+        linker_response = LinkerResponse(**parsed_response)
+        node_ids = {str(node.get("id")) for node in nodes}
+        document_ids = {str(document.get("id")) for document in documents}
+
+        for node_links in linker_response.links:
+            if node_links.node_id not in node_ids:
+                raise ValueError(f"Linker returned an unknown node ID: {node_links.node_id}")
+            for evidence_item in node_links.evidence_items:
+                if evidence_item.supportingDocId not in document_ids:
+                    raise ValueError(
+                        f"Linker returned an unknown document ID: {evidence_item.supportingDocId}"
+                    )
+                if not evidence_item.excerpt.strip():
+                    raise ValueError("Linker returned an empty evidence excerpt")
+
+        return linker_response
+    except json.JSONDecodeError as error:
+        print(f"[ai_api] linker_model: Invalid JSON from linker agent: {error}")
+        raise HTTPException(status_code=502, detail="Linker agent returned invalid JSON")
+    except Exception as e:
+        print(f"[ai_api] linker_model: Error during evidence linking: {e}")
+        raise HTTPException(status_code=500, detail=f"Evidence linking failed: {str(e)}")

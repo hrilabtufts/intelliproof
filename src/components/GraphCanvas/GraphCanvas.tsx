@@ -761,11 +761,20 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
       supportingDocName: string;
       excerpt: string;
       confidence: number;
+      isClone?: boolean;
     }>
   >([]);
   const [selectedEvidenceCard, setSelectedEvidenceCard] = useState<
     null | (typeof evidenceCards)[0]
   >(null);
+  const isOriginalEvidenceCard = (card: (typeof evidenceCards)[0]) =>
+    !card.isClone && (card.id.startsWith("ev_") || !card.id.includes("_"));
+  const [isAutoLinking, setIsAutoLinking] = useState(false);
+  const autoLinkAbortControllerRef = useRef<AbortController | null>(null);
+  const autoLinkOriginalStateRef = useRef<{
+    evidenceCards: typeof evidenceCards;
+    nodes: ClaimNode[];
+  } | null>(null);
 
   // Install global fetch logger for this component lifecycle
   useEffect(() => {
@@ -1739,7 +1748,11 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   const clamp = (val: number, min: number, max: number) =>
     Math.max(min, Math.min(max, val));
 
-  const handleSave = async () => {
+  const handleSave = async (overrides?: {
+    evidenceCards?: typeof evidenceCards;
+    nodes?: ClaimNode[];
+    edges?: ClaimEdge[];
+  }) => {
     logAction(
       "save_graph",
       { graphId: currentGraphId || currentGraph?.id },
@@ -1758,9 +1771,12 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
     }
 
     // Format the graph data according to the required structure
+    const evidenceToSave = overrides?.evidenceCards ?? evidenceCards;
+    const nodesToSave = overrides?.nodes ?? nodes;
+    const edgesToSave = overrides?.edges ?? edges;
     const graphData = {
-      evidence: evidenceCards,
-      nodes: nodes.map((node) => ({
+      evidence: evidenceToSave,
+      nodes: nodesToSave.map((node) => ({
         id: node.id,
         text: node.data.text,
         type: node.data.type,
@@ -1773,7 +1789,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
         isLocked: Boolean(node.data.isLocked),
         evidenceIds: node.data.evidenceIds || [],
       })),
-      edges: edges.map((edge) => {
+      edges: edgesToSave.map((edge) => {
         const edgeData = {
           id: edge.id,
           source: edge.source,
@@ -1828,6 +1844,134 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   const handleUpload = async () => {
     setIsUploadModalOpen(true);
   };
+
+  const restoreAutoLinkState = useCallback(() => {
+    const originalState = autoLinkOriginalStateRef.current;
+    if (!originalState) return;
+    setEvidenceCards(originalState.evidenceCards);
+    setNodes(originalState.nodes);
+    autoLinkOriginalStateRef.current = null;
+  }, []);
+
+  const handleCancelAutoLink = useCallback(() => {
+    autoLinkAbortControllerRef.current?.abort();
+    autoLinkAbortControllerRef.current = null;
+    restoreAutoLinkState();
+    setIsAutoLinking(false);
+    setToast("Evidence linking cancelled.");
+    setTimeout(() => setToast(null), 2500);
+  }, [restoreAutoLinkState]);
+
+  const handleAutoLink = useCallback(async () => {
+    if (isAutoLinking) return;
+
+    const originalEvidenceCards = evidenceCards;
+    const originalNodes = nodes;
+    autoLinkOriginalStateRef.current = {
+      evidenceCards: originalEvidenceCards,
+      nodes: originalNodes,
+    };
+    const controller = new AbortController();
+    autoLinkAbortControllerRef.current = controller;
+    setIsAutoLinking(true);
+
+    try {
+      const response = await fetch("/api/ai/linker", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_message: "Automatically link supporting documents to relevant graph claims.",
+          chat_history: [],
+          graph_data: {
+            nodes: originalNodes.map((node) => ({
+              id: node.id,
+              text: node.data.text,
+              type: node.data.type,
+            })),
+            supportingDocuments,
+          },
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || errorData.error || "Evidence linking failed");
+      }
+
+      const result: {
+        links: Array<{
+          node_id: string;
+          evidence_items: Array<{
+            id: string;
+            supportingDocId: string;
+            supportingDocName: string;
+            title: string;
+            excerpt: string;
+            confidence: number;
+          }>;
+        }>;
+      } = await response.json();
+
+      const nextEvidenceCards = [...originalEvidenceCards];
+      const nextNodes = originalNodes.map((node) => ({
+        ...node,
+        data: { ...node.data, evidenceIds: [...(node.data.evidenceIds || [])] },
+      }));
+
+      for (const nodeLink of result.links || []) {
+        const targetNode = nextNodes.find((node) => node.id === nodeLink.node_id);
+        if (!targetNode) continue;
+
+        for (const item of nodeLink.evidence_items || []) {
+          const existingEvidence = nextEvidenceCards.find(
+            (card) =>
+              card.supportingDocId === item.supportingDocId &&
+              card.excerpt.trim() === item.excerpt.trim()
+          );
+          const originalEvidence = existingEvidence || {
+            id: item.id,
+            title: item.title,
+            supportingDocId: item.supportingDocId,
+            supportingDocName: item.supportingDocName,
+            excerpt: item.excerpt,
+            confidence: item.confidence,
+          };
+
+          if (!existingEvidence) nextEvidenceCards.push(originalEvidence);
+          const cloneId = `${originalEvidence.id}__${targetNode.id}`;
+          const evidenceIds = targetNode.data.evidenceIds || [];
+          if (!evidenceIds.includes(cloneId)) {
+            nextEvidenceCards.push({ ...originalEvidence, id: cloneId, isClone: true });
+            targetNode.data.evidenceIds = [...evidenceIds, cloneId];
+          }
+        }
+      }
+
+      setEvidenceCards(nextEvidenceCards);
+      setNodes(nextNodes);
+      await handleSave({ evidenceCards: nextEvidenceCards, nodes: nextNodes });
+      autoLinkOriginalStateRef.current = null;
+      setIsAutoLinking(false);
+      setToast("Evidence linked successfully.");
+      setTimeout(() => setToast(null), 2500);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      restoreAutoLinkState();
+      setIsAutoLinking(false);
+      setToast(error instanceof Error ? error.message : "Evidence linking failed.");
+      setTimeout(() => setToast(null), 3500);
+    } finally {
+      autoLinkAbortControllerRef.current = null;
+    }
+  }, [
+    evidenceCards,
+    handleSave,
+    isAutoLinking,
+    nodes,
+    restoreAutoLinkState,
+    supportingDocuments,
+  ]);
 
   const handleDeleteDocument = async (id: string) => {
     try {
@@ -2018,6 +2162,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
       ...originalEvidence,
       id: newEvidenceId,
       confidence: originalEvidence.confidence, // Start with same confidence
+      isClone: true,
     };
 
     console.log(`[cloneEvidence] Cloned evidence:`, clonedEvidence);
@@ -5318,11 +5463,10 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
                 <div className="flex justify-end items-center gap-2 mb-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      console.log("[Auto Link] Placeholder action triggered");
-                    }}
+                    onClick={handleAutoLink}
+                    disabled={isAutoLinking}
                     className="px-3 py-1.5 rounded-md text-sm font-[DM Sans] font-medium text-[#F3F4F6] bg-gradient-to-r from-[#374151] to-[#232F3E] border border-[#4b5563] shadow-sm hover:from-[#2f3b4a] hover:to-[#1A2330] hover:shadow transition-all"
-                    title="Automatically link evidence to nodes (coming soon)"
+                    title="Automatically link evidence to nodes"
                   >
                     Auto Link
                   </button>
@@ -5333,9 +5477,29 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
                     + Add Evidence
                   </button>
                 </div>
+                {isAutoLinking && (
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+                    <div className="w-full max-w-sm rounded-lg bg-white p-6 text-center shadow-xl">
+                      <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-4 border-gray-200 border-t-[#232F3E]" />
+                      <h3 className="text-lg font-semibold text-gray-900">
+                        Linking in Progress
+                      </h3>
+                      <p className="mt-2 text-sm text-gray-500">
+                        Reviewing supporting documents and matching evidence to claims.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={handleCancelAutoLink}
+                        className="mt-5 rounded-md bg-gray-200 px-4 py-2 text-sm font-medium text-gray-800 hover:bg-gray-300"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {/* Evidence cards */}
                 <div className="space-y-3 max-h-[36vh] overflow-y-auto pr-1">
-                  {evidenceCards.filter((card) => !card.id.includes("_"))
+                  {evidenceCards.filter(isOriginalEvidenceCard)
                     .length === 0 ? (
                     <div className="p-4 bg-[#FAFAFA] rounded-md border border-gray-300 text-center text-gray-500 text-sm font-medium">
                       No evidence added yet.
@@ -5343,7 +5507,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
                   ) : (
                     // Only show original (non-cloned) evidence cards
                     evidenceCards
-                      .filter((card) => !card.id.includes("_"))
+                      .filter(isOriginalEvidenceCard)
                       .map((card) => {
                         const doc = supportingDocuments.find(
                           (d) => d.id === card.supportingDocId
