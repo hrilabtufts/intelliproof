@@ -33,7 +33,7 @@ export interface ClaimEdge {
     recommendedEdgeType?: EdgeType;
 
   };
-  markerStart?: {
+  markerEnd?: {
     type: MarkerType;
     color?: string;
   };

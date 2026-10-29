@@ -1169,7 +1169,7 @@ def critique_graph(data: CritiqueGraphRequest = Body(...)):
                 {"role": "system", "content": "You are an expert argument analyst and critical thinking specialist. Analyze argument graphs for logical flaws, fallacies, and pattern matches."},
                 {"role": "user", "content": prompt}
             ],
-            max_completion_tokens=2000,
+            max_completion_tokens=8192,
             temperature=1.0
         )
         

@@ -750,6 +750,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   const nodesInitialized = useNodesInitialized();
   const didInitViewportRef = useRef(false);
   const [connectingNodeId, setConnectingNodeId] = useState<string | null>(null);
+  const connectingNodeIdRef = useRef<string | null>(null);
   const [connectingHandleType, setConnectingHandleType] = useState<
     "source" | "target" | null
   >(null);
@@ -1206,7 +1207,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
               edgeScore,
               reasoning,
             },
-            markerStart: {
+            markerEnd: {
               type: MarkerType.ArrowClosed,
               color: edgeColor,
             },
@@ -1401,18 +1402,23 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
   const onConnect = useCallback(
     (params: Connection) => {
+      const sourceNodeId = connectingNodeIdRef.current ?? params.source;
+      const targetNodeId =
+        sourceNodeId === params.source ? params.target : params.source;
+      if (!sourceNodeId || !targetNodeId) return;
+
       takeSnapshot();
       logAction(
         "add_edge",
-        { source: params.source, target: params.target },
+        { source: sourceNodeId, target: targetNodeId },
         profile?.user_id
       );
       connectionCompleted.current = true; // Mark that a connection was made
       // Check if an edge already exists between these nodes
       const edgeExists = edges.some(
         (edge) =>
-          (edge.source === params.source && edge.target === params.target) ||
-          (edge.source === params.target && edge.target === params.source)
+          (edge.source === sourceNodeId && edge.target === targetNodeId) ||
+          (edge.source === targetNodeId && edge.target === sourceNodeId)
       );
 
       // If edge exists, don't create a new one
@@ -1421,8 +1427,8 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
       const isAttacking = edgeCreationType === "attacking";
       const newEdge: ClaimEdge = {
         id: `e-${uuidv4()}`,
-        source: params.source!,
-        target: params.target!,
+        source: sourceNodeId,
+        target: targetNodeId,
         type: "custom" as const,
         data: {
           edgeType: edgeCreationType,
@@ -1432,7 +1438,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
           edgeScore: isAttacking ? -0.01 : 0,
           reasoning: "",
         },
-        markerStart: {
+        markerEnd: {
           type: MarkerType.ArrowClosed,
           color: getDiscreteEdgeColor(isAttacking ? -0.01 : 0),
         },
@@ -1446,11 +1452,11 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
       // Trigger credibility calculation for the target node only
       console.log(
-        `[GraphCanvas] onConnect: Edge created between ${params.source} and ${params.target}, triggering credibility for target node ${params.target}`
+        `[GraphCanvas] onConnect: Edge created between ${sourceNodeId} and ${targetNodeId}, triggering credibility for target node ${targetNodeId}`
       );
 
       // Queue only the target node for credibility calculation
-      setApiQueue((q) => [...q, params.target!]);
+      setApiQueue((q) => [...q, targetNodeId]);
     },
     [edges, queueEdgeValidation]
   );
@@ -1458,6 +1464,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   const onConnectStart: OnConnectStart = useCallback(
     (_, { nodeId, handleType }) => {
       setConnectingNodeId(nodeId);
+      connectingNodeIdRef.current = nodeId;
       setConnectingHandleType(handleType);
     },
     []
@@ -1488,6 +1495,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
       // Clean up connection state
       setConnectingNodeId(null);
+      connectingNodeIdRef.current = null;
       setConnectingHandleType(null);
 
       // Use setTimeout to check after the event loop
@@ -1556,7 +1564,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
             relationshipConfidence: DEFAULT_RELATIONSHIP_CONFIDENCE,
             edgeScore: isAttackingNew ? -0.01 : 0,
           },
-          markerStart: {
+          markerEnd: {
             type: MarkerType.ArrowClosed,
             color: getDiscreteEdgeColor(isAttackingNew ? -0.01 : 0),
           },
@@ -1752,7 +1760,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
             ...e,
             ...updates,
             data: updatedData,
-            markerStart: {
+            markerEnd: {
               type: MarkerType.ArrowClosed,
               color: edgeColor,
             },
@@ -2947,7 +2955,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
               edgeScore: normalizedWeight,
               reasoning: "",
             },
-            markerStart: {
+            markerEnd: {
               type: MarkerType.ArrowClosed,
               color: getDiscreteEdgeColor(normalizedWeight),
             },
@@ -6882,7 +6890,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
                 type: "custom",
                 animated: true,
                 style: { cursor: "pointer" },
-                markerStart: {
+                markerEnd: {
                   type: MarkerType.ArrowClosed,
                   color: "#166534",
                 },

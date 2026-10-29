@@ -130,8 +130,8 @@ const CustomEdge: React.FC<EdgeProps<CustomEdgeData>> = ({
   targetPosition,
   data,
   style,
-  markerStart,
   markerEnd,
+  markerStart,
 }) => {
   // Determine edge color based on discrete score classification
   const score = typeof data?.edgeScore === "number" ? data.edgeScore : 0;
@@ -139,22 +139,13 @@ const CustomEdge: React.FC<EdgeProps<CustomEdgeData>> = ({
   const color: string = edgeClassification.color;
 
   // Keep arrow marker color in sync with computed stroke color and drop cached id so React Flow regenerates marker
-  const computedMarkerStart: any =
-    markerStart && typeof markerStart === "object"
-      ? (() => {
-        const { id: _ignoreId, ...rest } = markerStart as any;
-        return { ...rest, color };
-      })()
-      : markerStart;
-
-  // If there's an end marker, keep it in sync too
   const computedMarkerEnd: any =
-    markerEnd && typeof markerEnd === "object"
+    (markerEnd || markerStart) && typeof (markerEnd || markerStart) === "object"
       ? (() => {
-        const { id: _ignoreId, ...rest } = markerEnd as any;
+        const { id: _ignoreId, ...rest } = (markerEnd || markerStart) as any;
         return { ...rest, color };
       })()
-      : markerEnd;
+      : markerEnd || markerStart;
 
   // Get the bezier path for the edge and label position
   const [edgePath, labelX, labelY] = getBezierPath({
@@ -177,7 +168,6 @@ const CustomEdge: React.FC<EdgeProps<CustomEdgeData>> = ({
           strokeDasharray: "none",
           transition: "stroke 0.3s",
         }}
-        markerStart={computedMarkerStart}
         markerEnd={computedMarkerEnd}
       />
       {/* Edge classification label with color-coded styling */}
