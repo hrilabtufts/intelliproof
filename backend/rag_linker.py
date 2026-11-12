@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ai_models import LinkerEvidenceItem, LinkerNodeLinks, LinkerResponse
-from embedding import embed_documents
+from embedding import embed_query
 from llm_manager import MODEL_LUNA, ModelControlProtocol, run_llm
 
 
@@ -35,12 +35,13 @@ def _retrieve_candidates(
     embedding: list[float],
     user_id: str,
     graph_id: str,
+    match_threshold: float,
 ) -> list[RAGCandidate]:
     result = supabase.rpc(
         "match_graph_document_chunks",
         {
             "query_embedding": _vector_literal(embedding),
-            "match_threshold": RAG_MATCH_THRESHOLD,
+            "match_threshold": match_threshold,
             "match_count": RAG_MATCH_COUNT,
             "p_user_id": user_id,
             "p_graph_id": graph_id,
@@ -152,13 +153,14 @@ def run_rag_linker(
     nodes: list[dict[str, Any]],
     supabase: Any,
     selector: Callable[[str], str] | None = None,
+    match_threshold: float = RAG_MATCH_THRESHOLD,
 ) -> LinkerResponse:
     """Retrieve graph-local candidates and return exact, validated evidence links."""
     usable_nodes = [node for node in nodes if str(node.get("text") or "").strip()]
     if not usable_nodes:
         return LinkerResponse(links=[], summary="No claims with text were available for RAG search.")
 
-    embeddings = embed_documents([str(node["text"]) for node in usable_nodes])
+    embeddings = [embed_query(str(node["text"])) for node in usable_nodes]
     candidates_by_node: dict[str, list[RAGCandidate]] = {}
     for node, embedding in zip(usable_nodes, embeddings, strict=True):
         node_id = str(node["id"])
@@ -167,6 +169,7 @@ def run_rag_linker(
             embedding=embedding,
             user_id=user_id,
             graph_id=graph_id,
+            match_threshold=match_threshold,
         )
 
     selector = selector or (
@@ -174,7 +177,7 @@ def run_rag_linker(
             [{"role": "user", "content": prompt}],
             ModelControlProtocol(
                 model_name=MODEL_LUNA,
-                temperature=0.0,
+                temperature=1.0,
                 max_completion_tokens=2048,
                 dynamic_model_selection=False,
             ),

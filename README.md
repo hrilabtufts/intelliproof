@@ -1,6 +1,6 @@
 # Intelliproof
 
-A React-based web application built with TypeScript and Vite.
+A graph-based argument mapping application built with Next.js, React, and TypeScript. It includes a Python FastAPI backend for AI, academic search, and document indexing features.
 
 ## Prerequisites
 
@@ -26,15 +26,16 @@ Follow these steps to run the project locally:
    npm install
    ```
 
-3. Create a .env.local file in the root directory and add the following to it:
+3. Create a `.env.local` file in the root directory and add your Supabase configuration:
 
 ```bash
 # Supabase Configuration
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_url_here
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key_here
 
-# API Configuration (optional - defaults to localhost:8000 for development)
-# NEXT_PUBLIC_API_URL=http://localhost:8000
+# Optional server-side FastAPI URL override for RAG and Auto-Explore proxy routes.
+# Defaults to http://127.0.0.1:8000 in development and the deployed backend in production.
+# RAG_BACKEND_URL=http://127.0.0.1:8000
 ```
 
 4. Start the development server:
@@ -45,7 +46,7 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key_here
 
 5. Open your browser and navigate to:
    ```
-   http://localhost:5173
+   http://localhost:3000
    ```
 
 The application should now be running in development mode with hot-reload enabled, meaning any changes you make to the code will automatically update in the browser.
@@ -54,51 +55,83 @@ The application should now be running in development mode with hot-reload enable
 
 ```
 intelliproof/
-├── src/               # Source code
-├── public/           # Static assets
-├── index.html        # Entry HTML file
-├── package.json      # Project dependencies and scripts
-├── tsconfig.json     # TypeScript configuration
-├── vite.config.ts    # Vite configuration
-└── README.md         # Project documentation
+├── src/                 # Next.js pages, API routes, components, and client code
+├── backend/             # FastAPI service, academic search, and RAG indexing
+├── public/              # Static assets
+├── package.json         # Project dependencies and scripts
+├── next.config.js       # Next.js configuration
+├── tsconfig.json        # TypeScript configuration
+└── README.md            # Project documentation
 ```
 
 ## Available Scripts
 
 - `npm run dev` - Starts the development server
 - `npm run build` - Builds the app for production
-- `npm run preview` - Locally preview the production build
+- `npm start` - Starts the production server after `npm run build`
+- `npm run test:ui` - Runs UI unit tests with Vitest
 
 ## Technologies Used
 
 - React 18
 - TypeScript
-- Vite
+- Next.js 14
 - Tailwind CSS
+- FastAPI
 
 ## API Configuration
 
-The application uses a centralized configuration for API endpoints located in `src/lib/config.ts`. This allows for easy switching between development and production environments.
+The application uses Next.js API routes for server-side operations. Auto-Explore uses same-origin routes that forward requests to the FastAPI backend and pass through the user's authorization token.
 
 ### Environment Variables
 
-- `NEXT_PUBLIC_API_URL`: Set this to your production API URL when deploying. If not set, it defaults to `http://localhost:8000` for development.
+- `RAG_BACKEND_URL`: Optional server-side URL override for Auto-Explore and document-ingestion proxy routes. It defaults to `http://127.0.0.1:8000` in development and `https://intelliproofbackend.vercel.app` in production.
+- `NEXT_PUBLIC_API_URL`: Existing RAG proxy routes may use this as a production fallback. Auto-Explore uses its own production default; set `RAG_BACKEND_URL` to override it.
 
 ### Usage
 
-All API calls now use the centralized configuration:
+Auto-Explore requests use these same-origin endpoints:
 
-```typescript
-import { API_URLS } from "../lib/config";
-
-// Instead of hardcoded URLs like:
-// fetch('http://localhost:8000/api/signup')
-
-// Use the centralized configuration:
-fetch(API_URLS.SIGNUP);
+```text
+POST /api/ai/auto-explore
+POST /api/ai/auto-explore/import
 ```
 
-This makes it easy to switch between environments without modifying individual files.
+Set `RAG_BACKEND_URL` when the FastAPI service is hosted at a non-default address.
+
+## Auto-Explore
+
+Auto-Explore is available from the graph toolbar. Choose one or more academic sources—arXiv, Semantic Scholar, and PubMed—then select **Search**. The backend plans up to three queries from the current graph snapshot and calls only the selected sources, returning up to five records per query and source.
+
+The graph snapshot includes claims, connections, evidence, and supporting documents. arXiv searches use fielded keyword expressions; PubMed retries an empty natural-language search with a broader keyword query. Provider requests are paced and retry transient rate-limit responses. The results summary reports provider records retrieved before duplicate and relevance filtering, so the record count can include the same paper from multiple queries. A paper appears as a suggestion only when the assessor finds a qualifying match to an existing claim. Relevance confidence is not evidence strength.
+
+Review the suggested papers (none selected by default) and choose which to add. If graph content or supporting documents change while results are open, the results are marked stale and a new search is required before importing. Auto-Explore does not create claims, connections, or evidence cards. On import, the backend verifies graph ownership and checks for duplicates again. It stores a validated, provider-declared, directly accessible PDF when available and within the 10 MB document limit. Otherwise it stores a plain-text citation with the abstract when available and a paper link. The document metadata records source and claim-match provenance. Imported documents are queued for RAG indexing and the graph's Documents list is refreshed. Import results report per-paper success, duplicates, and failures. Imports use the existing `supporting_documents` table and `supporting-document-storage` Supabase bucket; no schema migration is required.
+
+### Optional academic provider settings
+
+The academic providers do not require credentials for basic search. Optional backend environment variables are:
+
+```bash
+SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
+NCBI_API_KEY=your_ncbi_api_key
+NCBI_EMAIL=your_contact_email
+```
+
+The Semantic Scholar client spaces requests by at least one second and honors retry delays. PubMed and arXiv requests are also paced by the backend client.
+
+### Auto-Explore tests
+
+Backend tests use mocked provider and storage clients:
+
+```bash
+python -m pytest -q backend/test_academic_api_parser.py backend/test_auto_explorer.py backend/test_auto_explore_import.py
+```
+
+UI component tests:
+
+```bash
+npm run test:ui
+```
 
 CURRENT SQL
 
@@ -189,23 +222,36 @@ create policy if not exists "Authenticated insert notes" on notes for insert to 
 create policy if not exists "Authenticated update own notes" on notes for update to authenticated using (true) with check (true);
 create policy if not exists "Authenticated delete own notes" on notes for delete to authenticated using (true);
 
-Backend Server
+## Backend Server
 
 Create a file named .env in the backend directory with the following content:
 
-SUPABASE_URL = your_supabase_url
-SUPABASE_KEY = your_supabase_anon_key
-JWT_SECRET_KEY = your_jwt_secret_key
+```bash
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_anon_key
+JWT_SECRET_KEY=your_jwt_secret_key
+OPENAI_API_KEY=your_openai_api_key
 
+# Optional academic-provider credentials
+SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
+NCBI_API_KEY=your_ncbi_api_key
+NCBI_EMAIL=your_contact_email
+```
+
+Then install the backend dependencies and start FastAPI:
+
+```bash
 cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
 
-For local uploads, the Next.js server triggers RAG ingestion through
-`http://127.0.0.1:8000`. Set `RAG_BACKEND_URL` when the backend runs on a
-different host or port.
+For local uploads and Auto-Explore, the Next.js server proxies backend requests
+through `http://127.0.0.1:8000`. Set `RAG_BACKEND_URL` when the backend runs on a
+different host or port. `OPENAI_API_KEY` is required by the backend's AI planner
+and paper assessor.
 
 TODO
 
@@ -240,6 +286,7 @@ Set these in your Vercel dashboard or via CLI:
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
 NEXT_PUBLIC_API_URL=https://intelliproofbackend.vercel.app
+RAG_BACKEND_URL=https://intelliproofbackend.vercel.app
 ```
 
 #### Deploy Commands
@@ -252,7 +299,7 @@ vercel login
 vercel --prod
 
 # Or deploy with environment variables inline
-vercel --prod -e NEXT_PUBLIC_SUPABASE_URL=your_url -e NEXT_PUBLIC_SUPABASE_ANON_KEY=your_key -e NEXT_PUBLIC_API_URL=https://intelliproofbackend.vercel.app
+vercel --prod -e NEXT_PUBLIC_SUPABASE_URL=your_url -e NEXT_PUBLIC_SUPABASE_ANON_KEY=your_key -e NEXT_PUBLIC_API_URL=https://intelliproofbackend.vercel.app -e RAG_BACKEND_URL=https://intelliproofbackend.vercel.app
 ```
 
 ### Backend Deployment (Vercel)
@@ -270,6 +317,11 @@ Set these in your Vercel dashboard for the backend project:
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_KEY=your_supabase_anon_key
 JWT_SECRET_KEY=your_jwt_secret_for_token_signing
+OPENAI_API_KEY=your_openai_api_key
+# Optional academic provider credentials:
+SEMANTIC_SCHOLAR_API_KEY=your_semantic_scholar_api_key
+NCBI_API_KEY=your_ncbi_api_key
+NCBI_EMAIL=your_contact_email
 ```
 
 #### Deploy Commands

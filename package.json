@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test:ui": "vitest run",
     "postinstall": "cp node_modules/pdfjs-dist/build/pdf.worker.mjs public/pdf.worker.mjs"
   },
   "dependencies": {
@@ -41,14 +42,20 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
     "@types/dagre": "^0.7.54",
     "@types/formidable": "^3.4.5",
     "@types/node": "^20.11.19",
     "@types/react": "^18.2.57",
     "@types/react-dom": "^18.2.19",
+    "@vitejs/plugin-react": "^6.2.1",
     "eslint": "^8.56.0",
     "eslint-config-next": "14.1.0",
-    "typescript": "^5.3.3"
+    "jsdom": "^29.1.1",
+    "typescript": "^5.3.3",
+    "vite": "^8.3.6",
+    "vitest": "^4.1.12"
   },
   "overrides": {
     "pdfjs-dist": "5.3.93"

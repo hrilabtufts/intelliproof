@@ -8,13 +8,17 @@ returns partial results from combined searches when one provider is unavailable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import os
 import re
 import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, urlparse
 from weakref import WeakKeyDictionary
@@ -41,43 +45,100 @@ PUBMED_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi
 PUBMED_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 MAX_RESULTS_PER_PROVIDER = 100
 DEFAULT_TIMEOUT_SECONDS = 15.0
-ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 3.0
+# Conservative spacing follows each provider's published rate guidance.
+ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 3.05
+SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL_SECONDS = 1.05
+PUBMED_MIN_REQUEST_INTERVAL_NO_KEY_SECONDS = 0.34
+PUBMED_MIN_REQUEST_INTERVAL_WITH_KEY_SECONDS = 0.11
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _ARXIV_NS = "http://arxiv.org/schemas/atom"
+_QUERY_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "between", "by", "for",
+    "from", "in", "into", "is", "of", "on", "or", "the", "to", "versus",
+    "vs", "was", "were", "with", "without",
+}
 
 
 @dataclass
-class _ArxivRateLimiter:
+class _ProviderRateLimiter:
     lock: asyncio.Lock
     last_request_at: float | None = None
+    blocked_until: float = 0.0
 
 
-_ARXIV_RATE_LIMITERS: WeakKeyDictionary[asyncio.AbstractEventLoop, _ArxivRateLimiter] = WeakKeyDictionary()
-_ARXIV_RATE_LIMITERS_GUARD = threading.Lock()
+# Shared across client instances on the same backend event loop.
+_PROVIDER_RATE_LIMITERS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, str], _ProviderRateLimiter]
+] = WeakKeyDictionary()
+_PROVIDER_RATE_LIMITERS_GUARD = threading.Lock()
 
 
-def _get_arxiv_rate_limiter() -> _ArxivRateLimiter:
+def _get_provider_rate_limiter(
+    source: AcademicSource,
+    credential: str | None = None,
+) -> _ProviderRateLimiter:
     loop = asyncio.get_running_loop()
-    with _ARXIV_RATE_LIMITERS_GUARD:
-        limiter = _ARXIV_RATE_LIMITERS.get(loop)
+    credential_scope = (
+        hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        if credential
+        else "public"
+    )
+    key = (source, credential_scope)
+    with _PROVIDER_RATE_LIMITERS_GUARD:
+        loop_limiters = _PROVIDER_RATE_LIMITERS.get(loop)
+        if loop_limiters is None:
+            loop_limiters = {}
+            _PROVIDER_RATE_LIMITERS[loop] = loop_limiters
+        limiter = loop_limiters.get(key)
         if limiter is None:
-            limiter = _ArxivRateLimiter(lock=asyncio.Lock())
-            _ARXIV_RATE_LIMITERS[loop] = limiter
+            limiter = _ProviderRateLimiter(lock=asyncio.Lock())
+            loop_limiters[key] = limiter
         return limiter
 
 
-async def _wait_for_arxiv_request_slot() -> None:
-    """Space arXiv request starts within this process and event loop."""
+async def _wait_for_provider_request_slot(
+    limiter: _ProviderRateLimiter,
+    min_interval: float,
+) -> None:
+    """Wait for a provider slot while holding its lock through the request."""
     loop = asyncio.get_running_loop()
-    limiter = _get_arxiv_rate_limiter()
-    async with limiter.lock:
-        if limiter.last_request_at is not None:
-            elapsed = loop.time() - limiter.last_request_at
-            remaining = ARXIV_MIN_REQUEST_INTERVAL_SECONDS - elapsed
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-        limiter.last_request_at = loop.time()
+    now = loop.time()
+    next_slot_at = limiter.blocked_until
+    if limiter.last_request_at is not None:
+        next_slot_at = max(next_slot_at, limiter.last_request_at + min_interval)
+    if next_slot_at > now:
+        await asyncio.sleep(next_slot_at - now)
+    limiter.last_request_at = loop.time()
+
+
+def _retry_delay(
+    response: httpx.Response,
+    attempt: int,
+    min_interval: float,
+) -> float:
+    """Read Retry-After as seconds or an HTTP date, then fall back to backoff."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            seconds = float(retry_after)
+            if math.isfinite(seconds):
+                return max(0.0, seconds)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError, IndexError):
+            pass
+
+    delay = min(10.0, 0.25 * (2**attempt))
+    if response.status_code == 429:
+        delay = max(delay, min(10.0, min_interval * (2 ** (attempt + 1))))
+    return delay
 
 
 class AcademicAPIError(RuntimeError):
@@ -134,6 +195,36 @@ def _normalize_doi(value: Any) -> str | None:
     doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
     doi = re.sub(r"^doi:\s*", "", doi, flags=re.IGNORECASE)
     return doi.rstrip(".,; ") or None
+
+
+def _search_terms(query: str, *, limit: int = 8) -> list[str]:
+    """Return distinct content words for provider-specific query syntax."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in re.findall(r"[a-z0-9]+", query.casefold()):
+        if len(term) < 2 or term in _QUERY_STOP_WORDS or term in seen:
+            continue
+        terms.append(term)
+        seen.add(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _arxiv_search_expression(query: str) -> str:
+    """Build a valid, broad arXiv expression from the planner's plain text."""
+    terms = _search_terms(query)
+    if not terms:
+        terms = re.findall(r"[a-z0-9]+", query.casefold())[:8]
+    return " OR ".join(f"all:{term}" for term in terms)
+
+
+def _pubmed_broad_query(query: str) -> str | None:
+    """Build a recall-oriented fallback for PubMed's implicit AND searches."""
+    terms = _search_terms(query)
+    if len(terms) < 2:
+        return None
+    return " OR ".join(terms)
 
 
 def _string_list(values: Any) -> list[str]:
@@ -226,33 +317,71 @@ class AcademicClientService:
         if headers:
             request_headers.update(headers)
 
+        credential = None
+        min_interval = 0.0
+        if source == "arxiv":
+            min_interval = ARXIV_MIN_REQUEST_INTERVAL_SECONDS
+        elif source == "semantic_scholar":
+            credential = request_headers.get("x-api-key")
+            min_interval = SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL_SECONDS
+        elif source == "pubmed":
+            credential = str(params.get("api_key") or "") or None
+            min_interval = (
+                PUBMED_MIN_REQUEST_INTERVAL_WITH_KEY_SECONDS
+                if credential
+                else PUBMED_MIN_REQUEST_INTERVAL_NO_KEY_SECONDS
+            )
+
+        limiter = _get_provider_rate_limiter(source, credential)
         for attempt in range(self.max_retries + 1):
-            if source == "arxiv":
-                await _wait_for_arxiv_request_slot()
-            try:
-                response = await self._client.get(url, params=params, headers=request_headers)
-            except httpx.RequestError as exc:
-                if attempt < self.max_retries:
-                    await asyncio.sleep(0.25 * (2**attempt))
-                    continue
-                raise AcademicAPIError(source, f"request failed ({exc.__class__.__name__})") from exc
-
-            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < self.max_retries:
-                retry_after = response.headers.get("Retry-After")
+            should_retry = False
+            async with limiter.lock:
+                await _wait_for_provider_request_slot(limiter, min_interval)
                 try:
-                    delay = float(retry_after) if retry_after is not None else 0.25 * (2**attempt)
-                except ValueError:
+                    response = await self._client.get(
+                        url,
+                        params=params,
+                        headers=request_headers,
+                    )
+                except httpx.RequestError as exc:
+                    if attempt >= self.max_retries:
+                        raise AcademicAPIError(
+                            source,
+                            f"request failed ({exc.__class__.__name__})",
+                        ) from exc
                     delay = 0.25 * (2**attempt)
-                await asyncio.sleep(max(0.0, min(delay, 10.0)))
-                continue
+                    limiter.blocked_until = max(
+                        limiter.blocked_until,
+                        asyncio.get_running_loop().time() + delay,
+                    )
+                    should_retry = True
+                else:
+                    if response.status_code in _RETRYABLE_STATUS_CODES:
+                        delay = _retry_delay(response, attempt, min_interval)
+                        limiter.blocked_until = max(
+                            limiter.blocked_until,
+                            asyncio.get_running_loop().time() + delay,
+                        )
+                        if attempt < self.max_retries:
+                            should_retry = True
+                        else:
+                            raise AcademicAPIError(
+                                source,
+                                f"request returned HTTP {response.status_code} "
+                                f"after {attempt + 1} attempt(s)",
+                                status_code=response.status_code,
+                            )
+                    elif not response.is_success:
+                        raise AcademicAPIError(
+                            source,
+                            f"request returned HTTP {response.status_code}",
+                            status_code=response.status_code,
+                        )
+                    else:
+                        return response
 
-            if not response.is_success:
-                raise AcademicAPIError(
-                    source,
-                    f"request returned HTTP {response.status_code}",
-                    status_code=response.status_code,
-                )
-            return response
+            if should_retry:
+                continue
 
         # The loop always returns or raises; this guard keeps the return type
         # clear if retry behavior is changed in the future.
@@ -417,7 +546,7 @@ class AcademicClientService:
             "arxiv",
             ARXIV_API_URL,
             params={
-                "search_query": f"all:{normalized_query}",
+                "search_query": _arxiv_search_expression(normalized_query),
                 "start": 0,
                 "max_results": limit,
                 "sortBy": "relevance",
@@ -429,8 +558,20 @@ class AcademicClientService:
         except ET.ParseError as exc:
             raise AcademicAPIError("arxiv", "returned invalid Atom XML") from exc
 
+        entries = root.findall(f"{{{_ATOM_NS}}}entry")
+        if len(entries) == 1:
+            entry = entries[0]
+            error_title = _element_text(entry.find(f"{{{_ATOM_NS}}}title"))
+            error_id = _element_text(entry.find(f"{{{_ATOM_NS}}}id")) or ""
+            if error_title and error_title.casefold() == "error":
+                error_detail = _element_text(entry.find(f"{{{_ATOM_NS}}}summary"))
+                raise AcademicAPIError(
+                    "arxiv",
+                    f"search endpoint error: {error_detail or error_id or 'invalid query'}",
+                )
+
         papers: list[NormalizedPaper] = []
-        for entry in root.findall(f"{{{_ATOM_NS}}}entry"):
+        for entry in entries:
             paper_url = _element_text(entry.find(f"{{{_ATOM_NS}}}id"))
             title = _element_text(entry.find(f"{{{_ATOM_NS}}}title"))
             if not paper_url or not title:
@@ -498,50 +639,70 @@ class AcademicClientService:
         return params
 
     async def search_pubmed(self, query: str, limit: int = 5) -> list[NormalizedPaper]:
-        """Search PubMed, then fetch full citation and abstract metadata."""
+        """Search PubMed and fetch citations, broadening only empty searches.
+
+        PubMed's automatic term mapping ANDs untagged concepts together. The
+        planner produces natural-language queries, so a long precise query can
+        be too restrictive. In that case retry once with its distinct content
+        terms joined by OR, then let Auto-Explore's graph matcher rank papers.
+        """
         normalized_query = self._validate_search(query, limit)
-        search_params: dict[str, Any] = {
-            **self._pubmed_params(),
-            "term": normalized_query,
-            "retmode": "json",
-            "retmax": limit,
-        }
-        search_response = await self._get("pubmed", PUBMED_ESEARCH_URL, params=search_params)
-        try:
-            search_payload = search_response.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise AcademicAPIError("pubmed", "search endpoint returned invalid JSON") from exc
-        if not isinstance(search_payload, dict):
-            raise AcademicAPIError("pubmed", "search endpoint returned an unexpected response")
+        queries = [normalized_query]
+        broad_query = _pubmed_broad_query(normalized_query)
+        if broad_query and broad_query.casefold() != normalized_query.casefold():
+            queries.append(broad_query)
 
-        search_result = search_payload.get("esearchresult")
-        id_list = search_result.get("idlist", []) if isinstance(search_result, dict) else []
-        if not isinstance(id_list, list):
-            raise AcademicAPIError("pubmed", "search response did not contain an identifier list")
-        pmids = [str(pmid).strip() for pmid in id_list if str(pmid).strip()]
-        if not pmids:
-            return []
+        for candidate_query in queries:
+            search_params: dict[str, Any] = {
+                **self._pubmed_params(),
+                "term": candidate_query,
+                "retmode": "json",
+                "retmax": limit,
+            }
+            search_response = await self._get(
+                "pubmed",
+                PUBMED_ESEARCH_URL,
+                params=search_params,
+            )
+            try:
+                search_payload = search_response.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise AcademicAPIError("pubmed", "search endpoint returned invalid JSON") from exc
+            if not isinstance(search_payload, dict):
+                raise AcademicAPIError("pubmed", "search endpoint returned an unexpected response")
 
-        fetch_params = {
-            **self._pubmed_params(),
-            "id": ",".join(pmids),
-            "rettype": "abstract",
-            "retmode": "xml",
-        }
-        fetch_response = await self._get("pubmed", PUBMED_EFETCH_URL, params=fetch_params)
-        try:
-            root = ET.fromstring(fetch_response.content)
-        except ET.ParseError as exc:
-            raise AcademicAPIError("pubmed", "fetch endpoint returned invalid XML") from exc
+            search_result = search_payload.get("esearchresult")
+            id_list = search_result.get("idlist", []) if isinstance(search_result, dict) else []
+            if not isinstance(id_list, list):
+                raise AcademicAPIError("pubmed", "search response did not contain an identifier list")
+            pmids = [str(pmid).strip() for pmid in id_list if str(pmid).strip()]
+            if not pmids:
+                continue
 
-        papers_by_pmid: dict[str, NormalizedPaper] = {}
-        for record in root.findall(".//PubmedArticle"):
-            paper = self._parse_pubmed_article(record)
-            if paper:
-                papers_by_pmid[paper.external_ids.get("pmid", "")] = paper
-        # EFetch normally preserves search order; keeping ESearch order gives
-        # callers consistent relevance ordering even if the feed does not.
-        return [papers_by_pmid[pmid] for pmid in pmids if pmid in papers_by_pmid]
+            fetch_params = {
+                **self._pubmed_params(),
+                "id": ",".join(pmids),
+                "rettype": "abstract",
+                "retmode": "xml",
+            }
+            fetch_response = await self._get("pubmed", PUBMED_EFETCH_URL, params=fetch_params)
+            try:
+                root = ET.fromstring(fetch_response.content)
+            except ET.ParseError as exc:
+                raise AcademicAPIError("pubmed", "fetch endpoint returned invalid XML") from exc
+
+            papers_by_pmid: dict[str, NormalizedPaper] = {}
+            for record in root.findall(".//PubmedArticle"):
+                paper = self._parse_pubmed_article(record)
+                if paper:
+                    papers_by_pmid[paper.external_ids.get("pmid", "")] = paper
+            # EFetch normally preserves search order; keeping ESearch order gives
+            # callers consistent relevance ordering even if the feed does not.
+            papers = [papers_by_pmid[pmid] for pmid in pmids if pmid in papers_by_pmid]
+            if papers:
+                return papers
+
+        return []
 
     @staticmethod
     def _parse_pubmed_article(record: ET.Element) -> NormalizedPaper | None:

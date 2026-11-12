@@ -12,7 +12,12 @@ Dependencies:
 """
 
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
+
+if __package__:
+    from .schemas.academic_api_schema import AcademicSource, NormalizedPaper
+else:  # Support importing backend modules directly from backend/.
+    from schemas.academic_api_schema import AcademicSource, NormalizedPaper
 
 
 class EvidenceModel(BaseModel):
@@ -422,3 +427,68 @@ class RAGLinkerNode(BaseModel):
 class RAGLinkerRequest(BaseModel):
     graph_id: str
     nodes: List[RAGLinkerNode]
+    match_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+
+
+class AutoExploreRequest(BaseModel):
+    """Current graph snapshot and selected sources for academic discovery."""
+
+    graph_id: str
+    sources: List[AcademicSource] = Field(min_length=1, max_length=3)
+    graph_data: Dict[str, Any] = Field(
+        description="Graph snapshot containing nodes, edges, evidence, and documents"
+    )
+
+
+class AutoExploreClaimMatch(BaseModel):
+    """A potential relationship between a paper record and one graph claim."""
+
+    claim_id: str
+    relation: Literal["supports", "challenges", "contextualizes"]
+    rationale: str = Field(min_length=1, max_length=600)
+    confidence: float = Field(ge=0.0, le=1.0, description="Estimated relevance, not evidence strength")
+
+
+class AutoExplorePaperMatch(BaseModel):
+    """An academic paper judged relevant to one or more existing claims."""
+
+    paper: NormalizedPaper
+    claim_matches: List[AutoExploreClaimMatch] = Field(min_length=1)
+
+
+class AutoExploreResponse(BaseModel):
+    """Matched academic records returned for user review before import."""
+
+    queries: List[str] = Field(default_factory=list)
+    matches: List[AutoExplorePaperMatch] = Field(default_factory=list)
+    errors: Dict[AcademicSource, str] = Field(default_factory=dict)
+    summary: str = ""
+
+
+class AutoExploreImportRequest(BaseModel):
+    """Selected Auto-Explore matches to add to a graph's supporting documents."""
+
+    graph_id: str
+    selected_matches: List[AutoExplorePaperMatch] = Field(min_length=1, max_length=45)
+
+
+class AutoExploreImportItem(BaseModel):
+    """One paper's document import result."""
+
+    paper_id: str
+    status: Literal["imported", "duplicate", "failed"]
+    storage_format: Optional[Literal["pdf", "text"]] = None
+    fallback_reason: Optional[str] = None
+    document_id: Optional[str] = None
+    document_name: Optional[str] = None
+    document_url: Optional[str] = None
+    document_type: Optional[str] = None
+    indexing_status: Optional[str] = None
+    error: Optional[str] = None
+
+
+class AutoExploreImportResponse(BaseModel):
+    """Per-paper outcomes from a selected-paper import request."""
+
+    results: List[AutoExploreImportItem] = Field(default_factory=list)
+    summary: str = ""

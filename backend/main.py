@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, status, Depends, Header
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from httpx import request
 from pydantic import BaseModel, EmailStr
@@ -14,6 +15,8 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 from rag_ingestion import ingest_document
+from ai_models import AutoExploreImportRequest, AutoExploreImportResponse
+from auto_explore_import import enqueue_imported_documents, import_selected_papers
 
 # Local AI implementations go into this file. API calls go to ai_api.py.
 
@@ -256,6 +259,46 @@ async def start_document_ingestion(
     background_tasks.add_task(_run_document_ingestion, ingestion_request, user_id)
     return {"document_id": request.document_id, "indexing_status": "pending"}
 
+
+@app.post(
+    "/api/ai/auto-explore/import",
+    response_model=AutoExploreImportResponse,
+)
+async def import_auto_explore_papers(
+    request: AutoExploreImportRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str = Header(None),
+):
+    """Store selected, graph-matched papers and queue them for RAG indexing."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database service not available")
+
+    user_id, email = await run_in_threadpool(
+        ai_api._require_auto_explore_graph_access,
+        request.graph_id,
+        authorization,
+    )
+    try:
+        result = await import_selected_papers(
+            supabase=supabase,
+            graph_id=request.graph_id,
+            user_id=user_id,
+            uploader_email=email,
+            selected_matches=request.selected_matches,
+        )
+    except RuntimeError as error:
+        print(f"[auto-explore] Could not prepare paper import: {error}")
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+    enqueue_imported_documents(
+        results=result.results,
+        background_tasks=background_tasks,
+        user_id=user_id,
+        ingestion_task=_run_document_ingestion,
+        ingestion_request_factory=RAGIngestionRequest,
+    )
+    return result
+
 # Models
 
 
@@ -487,4 +530,4 @@ if __name__ == "__main__":
         print(f"Failed to start server: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1) 
+        sys.exit(1)

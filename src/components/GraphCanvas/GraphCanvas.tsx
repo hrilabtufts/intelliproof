@@ -28,7 +28,7 @@ import type {
   OnConnectEnd,
   ReactFlowInstance,
 } from "reactflow";
-import { useState, useCallback, useRef, useEffect, Suspense } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo, Suspense } from "react";
 import "reactflow/dist/style.css";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
@@ -60,6 +60,15 @@ import {
 } from "../../store/slices/graphsSlice";
 import { ControlButton } from "reactflow";
 import SupportingDocumentUploadModal from "./SupportingDocumentUploadModal";
+import AutoExploreMenu, { type AcademicDatabase } from "./AutoExploreMenu";
+import AutoExploreResultsModal from "./AutoExploreResultsModal";
+import {
+  buildAutoExploreGraphSnapshot,
+  importAutoExploreMatches,
+  type AutoExploreImportItem,
+  type AutoExplorePaperMatch,
+  type AutoExploreResponse,
+} from "../../types/autoExplore";
 import type {
   GraphItem,
   SupportingDocument,
@@ -795,7 +804,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   >(null);
   const [linkedNodeIds, setLinkedNodeIds] = useState<string[] | null>(null);
   const isOriginalEvidenceCard = (card: (typeof evidenceCards)[0]) =>
-    !card.isClone && (card.id.startsWith("ev_") || !card.id.includes("_"));
+    !card.isClone;
   const getLinkedNodeIds = useCallback(
     (evidenceId: string) =>
       nodes
@@ -811,9 +820,22 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   );
   const [isAutoLinking, setIsAutoLinking] = useState(false);
   const [isAutoLinkMenuOpen, setIsAutoLinkMenuOpen] = useState(false);
+  const [selectedAcademicDatabases, setSelectedAcademicDatabases] = useState<
+    AcademicDatabase[]
+  >([]);
+  const [autoExploreResult, setAutoExploreResult] =
+    useState<AutoExploreResponse | null>(null);
+  const [autoExploreImportOutcomes, setAutoExploreImportOutcomes] = useState<
+    AutoExploreImportItem[]
+  >([]);
+  const [isAutoExploring, setIsAutoExploring] = useState(false);
+  const [isImportingAutoExplore, setIsImportingAutoExplore] = useState(false);
+  const [autoExploreError, setAutoExploreError] = useState<string | null>(null);
+  const autoExploreSnapshotKeyRef = useRef<string | null>(null);
   const [autoLinkMode, setAutoLinkMode] = useState<"full-document" | "rag">(
     "full-document"
   );
+  const [ragMatchThreshold, setRagMatchThreshold] = useState("0.65");
   const autoLinkAbortControllerRef = useRef<AbortController | null>(null);
   const autoLinkOriginalStateRef = useRef<{
     evidenceCards: typeof evidenceCards;
@@ -976,6 +998,155 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   // Use supportingDocuments from Redux
   const supportingDocumentsRedux = useSelector((state: RootState) =>
     currentGraphId ? state.graphs.supportingDocuments[currentGraphId] || [] : []
+  );
+
+  const autoExploreSnapshot = useMemo(
+    () =>
+      buildAutoExploreGraphSnapshot({
+        nodes,
+        edges,
+        evidence: evidenceCards,
+        documents: supportingDocumentsRedux,
+      }),
+    [nodes, edges, evidenceCards, supportingDocumentsRedux]
+  );
+  const autoExploreClaimLabels = useMemo(
+    () => Object.fromEntries(nodes.map((node) => [node.id, node.data.text])),
+    [nodes]
+  );
+  const autoExploreResultsAreStale = Boolean(
+    autoExploreResult &&
+      autoExploreSnapshotKeyRef.current &&
+      autoExploreSnapshotKeyRef.current !== autoExploreSnapshot.key
+  );
+
+  const handleAutoExploreSearch = useCallback(async () => {
+    const graphId = currentGraphId || currentGraph?.id;
+    if (!graphId || selectedAcademicDatabases.length === 0 || isAutoExploring) {
+      return;
+    }
+
+    const token = localStorage.getItem("access_token");
+    if (!token) {
+      setAutoExploreError("Please sign in again before searching academic databases.");
+      return;
+    }
+
+    setIsAutoExploring(true);
+    setAutoExploreError(null);
+    setAutoExploreResult(null);
+    setAutoExploreImportOutcomes([]);
+    try {
+      const documentRefresh = await dispatch(
+        fetchSupportingDocuments(graphId) as any
+      ).unwrap();
+      const searchSnapshot = buildAutoExploreGraphSnapshot({
+        nodes,
+        edges,
+        evidence: evidenceCards,
+        documents: documentRefresh.documents,
+      });
+      autoExploreSnapshotKeyRef.current = searchSnapshot.key;
+      const response = await fetch("/api/ai/auto-explore", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          graph_id: graphId,
+          sources: selectedAcademicDatabases,
+          graph_data: searchSnapshot.graph_data,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          payload?.detail || payload?.error || "Auto-Explore search failed."
+        );
+      }
+      setAutoExploreResult({
+        queries: Array.isArray(payload.queries) ? payload.queries : [],
+        matches: Array.isArray(payload.matches) ? payload.matches : [],
+        errors: payload.errors || {},
+        summary: payload.summary || "Auto-Explore search finished.",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Auto-Explore search failed.";
+      setAutoExploreError(message);
+    } finally {
+      setIsAutoExploring(false);
+    }
+  }, [
+    currentGraphId,
+    currentGraph?.id,
+    selectedAcademicDatabases,
+    isAutoExploring,
+    nodes,
+    edges,
+    evidenceCards,
+    dispatch,
+  ]);
+
+  const handleAutoExploreImport = useCallback(
+    async (matches: AutoExplorePaperMatch[]) => {
+      const graphId = currentGraphId || currentGraph?.id;
+      if (!graphId || !matches.length || autoExploreResultsAreStale || isImportingAutoExplore) {
+        return;
+      }
+      const token = localStorage.getItem("access_token");
+      if (!token) {
+        setAutoExploreError("Please sign in again before adding documents.");
+        return;
+      }
+
+      setIsImportingAutoExplore(true);
+      setAutoExploreError(null);
+      try {
+        const payload = await importAutoExploreMatches({
+          graphId,
+          accessToken: token,
+          matches,
+          refreshDocuments: async () => {
+            const refreshAction = await dispatch(
+              fetchSupportingDocuments(graphId) as any
+            );
+            if (refreshAction.meta?.requestStatus === "rejected") {
+              throw new Error(
+                refreshAction.error?.message || "Could not refresh graph documents."
+              );
+            }
+          },
+        });
+        const newOutcomes = payload.results;
+        setAutoExploreImportOutcomes((previous) => {
+          const merged = new Map(previous.map((item) => [item.paper_id, item]));
+          newOutcomes.forEach((item) => merged.set(item.paper_id, item));
+          return Array.from(merged.values());
+        });
+        if (payload.refreshError) {
+          setAutoExploreError(
+            `Papers were processed, but the Documents list could not be refreshed: ${payload.refreshError}`
+          );
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Could not add selected papers.";
+        setAutoExploreError(message);
+      } finally {
+        setIsImportingAutoExplore(false);
+      }
+    },
+    [
+      currentGraphId,
+      currentGraph?.id,
+      autoExploreResultsAreStale,
+      isImportingAutoExplore,
+      dispatch,
+    ]
   );
 
   // Map Redux docs to local state shape
@@ -1947,7 +2118,10 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
     setTimeout(() => setToast(null), 2500);
   }, [restoreAutoLinkState]);
 
-  const startAutoLink = useCallback(async (mode: "full-document" | "rag") => {
+  const startAutoLink = useCallback(async (
+    mode: "full-document" | "rag",
+    matchThreshold = 0.65,
+  ) => {
     if (isAutoLinking) return;
 
     const originalEvidenceCards = evidenceCards;
@@ -1973,6 +2147,7 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
               text: node.data.text,
               type: node.data.type,
             })),
+            match_threshold: matchThreshold,
           }
         : {
             user_message: "Use Full Document search to automatically link supporting documents to relevant graph claims.",
@@ -2097,9 +2272,20 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
   }, [isAutoLinking]);
 
   const handleAutoLinkModeSubmit = useCallback(() => {
+    if (autoLinkMode === "rag") {
+      const parsedThreshold = Number(ragMatchThreshold);
+      if (!Number.isFinite(parsedThreshold) || parsedThreshold < 0 || parsedThreshold > 1) {
+        setToast("RAG match threshold must be a number between 0 and 1.");
+        return;
+      }
+      setIsAutoLinkMenuOpen(false);
+      void startAutoLink(autoLinkMode, parsedThreshold);
+      return;
+    }
+
     setIsAutoLinkMenuOpen(false);
     void startAutoLink(autoLinkMode);
-  }, [autoLinkMode, startAutoLink]);
+  }, [autoLinkMode, ragMatchThreshold, startAutoLink]);
 
   const handleDeleteDocument = async (id: string) => {
     try {
@@ -2315,29 +2501,47 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
     event.dataTransfer.effectAllowed = "move";
   };
 
+  const isEvidenceReference = (referenceId: string, evidenceId: string) =>
+    referenceId === evidenceId || referenceId.startsWith(`${evidenceId}_`);
+
+  const removeEvidenceReferences = (evidenceId?: string) => {
+    const nextEvidenceCards = evidenceId
+      ? evidenceCards.filter(
+          (card) =>
+            card.id !== evidenceId &&
+            !(card.isClone && isEvidenceReference(card.id, evidenceId))
+        )
+      : [];
+    const nextNodes = nodes.map((node) => ({
+      ...node,
+      data: {
+        ...node.data,
+        evidenceIds: evidenceId
+          ? (node.data.evidenceIds || []).filter(
+              (referenceId) => !isEvidenceReference(referenceId, evidenceId)
+            )
+          : [],
+      },
+    }));
+
+    setEvidenceCards(nextEvidenceCards);
+    setNodes(nextNodes);
+    void handleSave({ evidenceCards: nextEvidenceCards, nodes: nextNodes }).catch(
+      (error) => {
+        console.error("Failed to persist evidence deletion:", error);
+        setToast("Evidence was removed locally, but could not be saved.");
+      }
+    );
+  };
+
   const handleDeleteEvidence = (evidenceId: string) => {
     console.log(`[handleDeleteEvidence] Deleting evidence: ${evidenceId}`);
+    removeEvidenceReferences(evidenceId);
+  };
 
-    // Remove the evidence from evidenceCards
-    setEvidenceCards((prev) => prev.filter((card) => card.id !== evidenceId));
-
-    // Remove the evidence ID from all nodes that reference it
-    setNodes((prevNodes) =>
-      prevNodes.map((node) => {
-        if (node.data.evidenceIds?.includes(evidenceId)) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              evidenceIds: node.data.evidenceIds.filter(
-                (id) => id !== evidenceId
-              ),
-            },
-          };
-        }
-        return node;
-      })
-    );
+  const handleDeleteAllEvidence = () => {
+    console.log("[handleDeleteAllEvidence] Deleting all evidence references");
+    removeEvidenceReferences();
   };
 
   // Handle evidence drop on nodes with cloning logic
@@ -5614,23 +5818,62 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
               {/* Evidence Management Section */}
               <div className="p-4 border-b-0 flex flex-col min-h-0">
-                <div className="flex justify-end items-center gap-2 mb-2">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDeleteAllEvidence}
+                    disabled={
+                      isAutoLinking ||
+                      (evidenceCards.length === 0 &&
+                        !nodes.some(
+                          (node) => (node.data.evidenceIds || []).length > 0
+                        ))
+                    }
+                    className="flex h-8 w-8 items-center justify-center rounded-md border border-red-300 bg-red-50 text-lg font-bold text-red-600 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-40"
+                    title="Delete all evidence"
+                    aria-label="Delete all evidence"
+                  >
+                    ×
+                  </button>
                   <button
                     type="button"
                     onClick={openAutoLinkMenu}
                     disabled={isAutoLinking}
-                    className="px-3 py-1.5 rounded-md text-sm font-[DM Sans] font-medium text-[#F3F4F6] bg-gradient-to-r from-[#374151] to-[#232F3E] border border-[#4b5563] shadow-sm hover:from-[#2f3b4a] hover:to-[#1A2330] hover:shadow transition-all"
+                    className="rounded-md border border-[#4b5563] bg-gradient-to-r from-[#374151] to-[#232F3E] px-3 py-1.5 text-sm font-[DM Sans] font-medium text-[#F3F4F6] shadow-sm transition-all hover:from-[#2f3b4a] hover:to-[#1A2330] hover:shadow"
                     title="Automatically link evidence to nodes"
                   >
                     Auto Link
                   </button>
+                  <AutoExploreMenu
+                    selectedDatabases={selectedAcademicDatabases}
+                    isSearching={isAutoExploring}
+                    disabled={!currentGraphId && !currentGraph?.id}
+                    onSearch={() => void handleAutoExploreSearch()}
+                    onToggleDatabase={(database) =>
+                      setSelectedAcademicDatabases((selected) =>
+                        selected.includes(database)
+                          ? selected.filter((item) => item !== database)
+                          : [...selected, database]
+                      )
+                    }
+                  />
+                  {isAutoExploring && (
+                    <span role="status" className="text-xs text-gray-600">
+                      Searching selected academic databases…
+                    </span>
+                  )}
                   <button
-                    className="px-3 py-1.5 bg-[#232F3E] text-[#F3F4F6] rounded-md hover:bg-[#1A2330] transition-colors text-sm font-[DM Sans] font-normal"
+                    className="ml-auto rounded-md bg-[#232F3E] px-3 py-1.5 text-sm font-[DM Sans] font-normal text-[#F3F4F6] transition-colors hover:bg-[#1A2330]"
                     onClick={() => setIsAddEvidenceOpen(true)}
                   >
                     + Add Evidence
                   </button>
                 </div>
+                {autoExploreError && !autoExploreResult && (
+                  <p role="alert" className="mb-2 text-sm text-red-700">
+                    {autoExploreError}
+                  </p>
+                )}
                 {isAutoLinkMenuOpen && !isAutoLinking && (
                   <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30">
                     <div
@@ -5703,7 +5946,26 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
                       {autoLinkMode === "rag" && (
                         <div className="mt-4 rounded-md border border-blue-100 bg-blue-50 p-3 text-sm leading-5 text-blue-900">
-                          IntelliProof first searches the prepared passages in this graph's documents, then selects the most relevant exact passages as evidence for each claim. Only passages above the relevance threshold are considered, making the results faster to review and keeping unrelated documents out of the search.
+                          <p>
+                            IntelliProof first searches the prepared passages in this graph's documents, then selects the most relevant exact passages as evidence for each claim.
+                          </p>
+                          <label className="mt-3 flex items-center justify-between gap-3 text-sm font-medium">
+                            <span>Match threshold</span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="1"
+                              step="0.01"
+                              inputMode="decimal"
+                              value={ragMatchThreshold}
+                              onChange={(event) => setRagMatchThreshold(event.target.value)}
+                              className="w-24 rounded border border-blue-200 bg-white px-2 py-1 text-right text-sm text-gray-900 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                              aria-label="RAG match threshold"
+                            />
+                          </label>
+                          <p className="mt-2 text-xs text-blue-800">
+                            Controls how similar a passage must be to a claim before it can be considered. Higher values return fewer, closer matches.
+                          </p>
                         </div>
                       )}
 
@@ -7011,8 +7273,8 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
 
             {/* Evidence Card Preview Modal */}
             {selectedEvidenceCard && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-30">
-                <div className="bg-white rounded-lg shadow-lg w-full max-w-md p-6 relative">
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-30 p-4">
+                <div className="relative flex max-h-[calc(100vh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-lg bg-white p-6 shadow-lg">
                   <button
                     className="absolute top-2 right-2 text-2xl text-gray-400 hover:text-gray-700"
                     onClick={() => {
@@ -7059,32 +7321,34 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
                     }
                     return null;
                   })()}
-                  <div className="mb-4">
-                    <span className="block text-xs font-medium mb-1">
-                      Excerpt / Description:
-                    </span>
-                    <div className="text-sm text-gray-700 whitespace-pre-line bg-[#FAFAFA] rounded p-2 border border-gray-100">
-                      {selectedEvidenceCard.excerpt}
+                  <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                    <div className="mb-4">
+                      <span className="mb-1 block text-xs font-medium">
+                        Excerpt / Description:
+                      </span>
+                      <div className="rounded border border-gray-100 bg-[#FAFAFA] p-2 text-sm text-gray-700 whitespace-pre-line">
+                        {selectedEvidenceCard.excerpt}
+                      </div>
                     </div>
-                  </div>
-                  {/* Optionally, show supporting doc preview if image */}
-                  {(() => {
-                    const doc = supportingDocuments.find(
-                      (d) => d.id === selectedEvidenceCard.supportingDocId
-                    );
-                    if (doc && doc.type === "image") {
-                      return (
-                        <div className="mt-2">
-                          <img
-                            src={doc.url}
-                            alt="preview"
-                            className="w-full max-h-48 object-contain rounded"
-                          />
-                        </div>
+                    {/* Optionally, show supporting doc preview if image */}
+                    {(() => {
+                      const doc = supportingDocuments.find(
+                        (d) => d.id === selectedEvidenceCard.supportingDocId
                       );
-                    }
-                    return null;
-                  })()}
+                      if (doc && doc.type === "image") {
+                        return (
+                          <div className="mt-2">
+                            <img
+                              src={doc.url}
+                              alt="preview"
+                              className="max-h-48 w-full rounded object-contain"
+                            />
+                          </div>
+                        );
+                      }
+                      return null;
+                    })()}
+                  </div>
                 </div>
                 {linkedNodeIds !== null && (
                   <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30">
@@ -7708,6 +7972,22 @@ const GraphCanvasInner = ({ hideNavbar = false }: GraphCanvasProps) => {
         uploaderEmail={profile?.email || ""}
         onSuccess={handleUploadSuccess}
 
+      />
+
+      <AutoExploreResultsModal
+        open={Boolean(autoExploreResult)}
+        result={autoExploreResult}
+        claimLabels={autoExploreClaimLabels}
+        stale={autoExploreResultsAreStale}
+        isImporting={isImportingAutoExplore}
+        error={autoExploreError}
+        outcomes={autoExploreImportOutcomes}
+        onImport={(matches) => void handleAutoExploreImport(matches)}
+        onClose={() => {
+          setAutoExploreResult(null);
+          setAutoExploreError(null);
+          autoExploreSnapshotKeyRef.current = null;
+        }}
       />
 
       {/* Notes Modals */}

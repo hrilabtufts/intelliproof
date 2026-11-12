@@ -1,5 +1,8 @@
+import pytest
+from pydantic import ValidationError
 from types import SimpleNamespace
 
+from ai_models import RAGLinkerRequest
 import rag_linker
 
 
@@ -35,7 +38,7 @@ class FakeSupabase:
 
 def test_run_rag_linker_retrieves_graph_scoped_candidates(monkeypatch):
     supabase = FakeSupabase()
-    monkeypatch.setattr(rag_linker, "embed_documents", lambda texts: [[0.1] * 768 for _ in texts])
+    monkeypatch.setattr(rag_linker, "embed_query", lambda text: [0.1] * 768)
 
     result = rag_linker.run_rag_linker(
         graph_id="graph-1",
@@ -58,8 +61,35 @@ def test_run_rag_linker_retrieves_graph_scoped_candidates(monkeypatch):
     assert payload["match_count"] == 4
 
 
+def test_run_rag_linker_passes_custom_match_threshold(monkeypatch):
+    supabase = FakeSupabase()
+    monkeypatch.setattr(rag_linker, "embed_query", lambda text: [0.1] * 768)
+
+    rag_linker.run_rag_linker(
+        graph_id="graph-1",
+        user_id="user-1",
+        nodes=[{"id": "node-1", "text": "The claim text"}],
+        supabase=supabase,
+        selector=lambda prompt: '{"selections": []}',
+        match_threshold=0.32,
+    )
+
+    assert supabase.calls[0][1]["match_threshold"] == 0.32
+
+
+def test_rag_linker_request_validates_match_threshold():
+    request = RAGLinkerRequest(graph_id="graph-1", nodes=[])
+
+    assert request.match_threshold == 0.65
+
+    with pytest.raises(ValidationError):
+        RAGLinkerRequest(graph_id="graph-1", nodes=[], match_threshold=-0.01)
+    with pytest.raises(ValidationError):
+        RAGLinkerRequest(graph_id="graph-1", nodes=[], match_threshold=1.01)
+
+
 def test_run_rag_linker_rejects_unreturned_candidate_ids(monkeypatch):
-    monkeypatch.setattr(rag_linker, "embed_documents", lambda texts: [[0.1] * 768 for _ in texts])
+    monkeypatch.setattr(rag_linker, "embed_query", lambda text: [0.1] * 768)
 
     result = rag_linker.run_rag_linker(
         graph_id="graph-1",

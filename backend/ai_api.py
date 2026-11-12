@@ -14,6 +14,7 @@ Dependencies:
 """
 
 from fastapi import APIRouter, HTTPException, Body, Query, Header
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import math
@@ -59,8 +60,11 @@ from ai_models import (
     ChatResponse,  # NEW
     LinkerResponse,
     RAGLinkerRequest,
+    AutoExploreRequest,
+    AutoExploreResponse,
 )
 from rag_linker import run_rag_linker
+from auto_explorer import run_auto_explorer
 from llm_manager import (
     run_llm,
     DEFAULT_MCP,
@@ -93,6 +97,55 @@ def _rag_supabase_client():
     if not url or not key:
         raise HTTPException(status_code=500, detail="Database service not available")
     return create_client(url, key)
+
+
+def _require_auto_explore_graph_access(
+    graph_id: str, authorization: str | None
+) -> tuple[str, str]:
+    """Require graph ownership and return the authenticated user's ID and email."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+
+    supabase = _rag_supabase_client()
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        user_response = supabase.auth.get_user(token)
+    except Exception as error:
+        raise HTTPException(status_code=401, detail="Invalid or expired session") from error
+    if not user_response or not user_response.user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    user_id = str(user_response.user.id)
+    try:
+        profile_response = (
+            supabase.table("profiles")
+            .select("email")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        profile = next(iter(profile_response.data or []), None)
+        if not profile or not profile.get("email"):
+            raise HTTPException(status_code=404, detail="User profile not found")
+
+        graph_response = (
+            supabase.table("graphs")
+            .select("id")
+            .eq("id", graph_id)
+            .eq("owner_email", profile["email"])
+            .limit(1)
+            .execute()
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"[auto-explore] Could not verify graph ownership: {error}")
+        raise HTTPException(status_code=503, detail="Could not verify graph access") from error
+
+    if not graph_response.data:
+        raise HTTPException(status_code=404, detail="Graph not found")
+
+    return user_id, profile["email"]
 
 PENDING_EVIDENCE_SCORE = 0.2
 
@@ -2652,6 +2705,7 @@ def rag_linker_model(
             user_id=user_id,
             nodes=[node.model_dump() for node in data.nodes],
             supabase=supabase,
+            match_threshold=data.match_threshold,
         )
         print(
             f"[rag-linker] Graph {data.graph_id}: "
@@ -2664,3 +2718,36 @@ def rag_linker_model(
     except Exception as error:
         print(f"[rag-linker] Failed for graph {data.graph_id}: {error}")
         raise HTTPException(status_code=500, detail=f"RAG evidence linking failed: {error}") from error
+
+
+@router.post("/api/ai/auto-explore", response_model=AutoExploreResponse)
+async def auto_explore_model(
+    data: AutoExploreRequest = Body(...),
+    authorization: str | None = Header(default=None),
+):
+    """Search selected academic providers and return claim-matched paper candidates."""
+    try:
+        await run_in_threadpool(
+            _require_auto_explore_graph_access,
+            data.graph_id,
+            authorization,
+        )
+        result = await run_auto_explorer(
+            graph_data=data.graph_data,
+            sources=data.sources,
+        )
+        print(
+            f"[auto-explore] Graph {data.graph_id}: searched {len(result.queries)} "
+            f"queries across {len(data.sources)} source(s), matched {len(result.matches)} papers"
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        print(f"[auto-explore] Failed for graph {data.graph_id}: {error}")
+        raise HTTPException(
+            status_code=502,
+            detail="Auto-Explore failed while planning, searching, or assessing papers",
+        ) from error
